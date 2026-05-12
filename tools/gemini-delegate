@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# gemini-delegate — Launch Gemini CLI headlessly, parse stream-json, report diff
+# Usage: gemini-delegate <workdir> <prompt> [timeout-secs] [mode]
+#
+# mode: impl (default) — --yolo, all tool calls auto-approved, files can be written
+#       plan            — --approval-mode plan, read-only exploration, no writes
+#
+# Unlike vibe-delegate, Gemini does NOT need a pseudo-TTY — it works fine in a
+# plain pipe. We cd into workdir and pass the prompt via -p/--prompt.
+#
+# LIMITS (baked into the design):
+#   - No --max-turns:    timeout is the only runaway-control lever
+#   - Context overhead:  Gemini loads ~900-10k tokens of system prompt before
+#                        your task even starts; budget for it in timeouts
+#   - 503 backoff:       on free-tier Gemini the CLI auto-retries with backoff
+#                        (can eat 60-90s silently before work begins)
+#   - No --agent flag:   single-mode only, no code-reviewer / planner agents
+#   - No --workdir flag: must cd into the directory before running
+#
+# RUN LOG (2026-05-12):
+#   Appends one JSONL entry to ~/.local/share/delegate-runs.jsonl after each run.
+#   Fields: ts, delegate, project, prompt_words, mode, timeout_secs, exit_code,
+#           timed_out, tool_calls, files_changed, syntax_errors, duration_secs,
+#           tokens_in, tokens_out, tokens_cached, tokens_total, cost_usd, model.
+
+WORKDIR="${1:?Usage: gemini-delegate <workdir> <prompt> [timeout-secs] [mode]}"
+PROMPT="${2:?Prompt required}"
+TIMEOUT_SECS="${3:-180}"
+MODE="${4:-impl}"
+
+if [ ! -d "$WORKDIR" ]; then
+  echo "ERROR: workdir '$WORKDIR' does not exist" >&2
+  exit 1
+fi
+
+cd "$WORKDIR" || exit 1
+START_NS=$(date +%s%N)
+PROMPT_WORDS=$(printf '%s' "$PROMPT" | wc -w | tr -d ' ')
+GIT_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "no-git")
+FILES_BEFORE=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
+
+if [ "$MODE" = "plan" ]; then
+  APPROVAL_FLAG="--approval-mode plan"
+  MODE_LABEL="plan (read-only)"
+else
+  APPROVAL_FLAG="--yolo"
+  MODE_LABEL="impl (yolo)"
+fi
+
+echo "=== GEMINI START ==="
+echo "Workdir : $WORKDIR"
+echo "Mode    : $MODE_LABEL"
+echo "Timeout : ${TIMEOUT_SECS}s"
+echo "Prompt  : ${PROMPT:0:120}..."
+echo "===================="
+
+# Write prompt to a temp file — avoids shell injection for prompts containing
+# colons, quotes, emojis, accented chars, or multi-line code blocks.
+PROMPT_FILE=$(mktemp /tmp/gemini-prompt-XXXXXX.txt)
+
+# Stats handoff file: Python parser writes JSON here; bash reads it for the log.
+DELEGATE_STATS_FILE=$(mktemp /tmp/delegate-stats-XXXXXX.json)
+printf '{}' > "$DELEGATE_STATS_FILE"
+export DELEGATE_STATS_FILE
+
+trap 'rm -f "$PROMPT_FILE" "$DELEGATE_STATS_FILE" /tmp/gemini-syntax-err.txt' EXIT
+printf '%s' "$PROMPT" > "$PROMPT_FILE"
+
+PROMPT_CONTENT=$(cat "$PROMPT_FILE")
+
+# Run Gemini in headless mode, streaming JSON events.
+# plan mode: --approval-mode plan → read-only, no writes executed
+# impl mode: --yolo              → all tool calls auto-approved
+# -o stream-json emits one JSON event per line.
+export GEMINI_MODE="$MODE"
+# shellcheck disable=SC2086  — APPROVAL_FLAG intentionally unquoted (may be two words)
+timeout "$TIMEOUT_SECS" gemini -p "$PROMPT_CONTENT" $APPROVAL_FLAG -o stream-json 2>&1 | python3 -c "
+import sys, json, re, os
+
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*[mABCDEFGHJKSTfhilmnprsu]|\x0f|\x0e')
+tool_calls = 0
+writes = []
+final_stats = None
+model_name = 'gemini'
+plan_mode = os.environ.get('GEMINI_MODE') == 'plan'
+
+def clean(line):
+    line = line.replace('\r', '')
+    return ANSI_RE.sub('', line).strip()
+
+for raw in sys.stdin:
+    line = clean(raw)
+    if not line or line.startswith('Warning:') or line.startswith('YOLO') or line.startswith('Attempt'):
+        continue
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+
+    t = ev.get('type', '')
+
+    if t == 'init':
+        model_name = ev.get('model', 'gemini')
+        print(f'  [init]  model={model_name}', flush=True)
+
+    elif t == 'message':
+        role = ev.get('role', '')
+        if role == 'assistant':
+            content = ev.get('content', '').strip()
+            if content:
+                print(f'  [gemini] {content[:400]}', flush=True)
+
+    elif t in ('tool_call', 'tool_use'):
+        tool_calls += 1
+        name = ev.get('name', ev.get('tool', ''))
+        inp  = ev.get('input', ev.get('parameters', {}))
+        path = inp.get('path', '') or inp.get('file_path', '') or inp.get('filename', '') if isinstance(inp, dict) else ''
+        if 'write' in name.lower() or 'edit' in name.lower() or 'create' in name.lower():
+            if path:
+                writes.append(path)
+            label = '[plan-write]' if plan_mode else '[write]'
+            print(f'  {label}  {path or name}', flush=True)
+        elif 'read' in name.lower():
+            print(f'  [read]   {path or name}', flush=True)
+        elif 'search' in name.lower() or 'grep' in name.lower():
+            print(f'  [search] {name}', flush=True)
+        elif 'shell' in name.lower() or 'exec' in name.lower() or 'run' in name.lower() or 'bash' in name.lower():
+            cmd = inp.get('command', inp.get('cmd', '')) if isinstance(inp, dict) else ''
+            print(f'  [shell]  {cmd[:100] or name}', flush=True)
+        else:
+            print(f'  [tool]   {name}', flush=True)
+
+    elif t == 'tool_result':
+        content = ev.get('content', '')
+        first = (content or '').split('\n')[0][:100] if isinstance(content, str) else ''
+        if 'error' in first.lower() or 'failed' in first.lower():
+            print(f'  [WARN]   {first}', flush=True)
+
+    elif t == 'result':
+        final_stats = ev.get('stats', {})
+
+print(f'Tool calls: {tool_calls}')
+
+# Compute and print cost, then write full stats to the handoff file.
+cost_gemini = 0.0
+if final_stats:
+    inp_tok = final_stats.get('input_tokens', 0)
+    out_tok = final_stats.get('output_tokens', 0)
+    cached  = final_stats.get('cached', 0)
+    total   = final_stats.get('total_tokens', 0)
+    dur_ms  = final_stats.get('duration_ms', 0)
+    cost_gemini = (inp_tok * 0.15 + out_tok * 0.60) / 1_000_000
+    cost_claude = (inp_tok * 3.0  + out_tok * 15.0) / 1_000_000
+    ratio = cost_claude / cost_gemini if cost_gemini > 0 else 0
+    print(f'Gemini tokens: {total:,}  ({inp_tok:,} in + {out_tok:,} out, {cached:,} cached)  |  ~\${cost_gemini:.4f}  ({dur_ms/1000:.1f}s)')
+    if ratio > 0:
+        print(f'Claude Sonnet 4.6 eq: same tokens ~\${cost_claude:.4f}  (ratio x{ratio:.1f})')
+
+sf = os.environ.get('DELEGATE_STATS_FILE', '')
+if sf:
+    try:
+        payload = {'tool_calls': tool_calls, 'model': model_name}
+        if final_stats:
+            payload.update({
+                'tokens_in':     final_stats.get('input_tokens', 0),
+                'tokens_out':    final_stats.get('output_tokens', 0),
+                'tokens_cached': final_stats.get('cached', 0),
+                'tokens_total':  final_stats.get('total_tokens', 0),
+                'cost_usd':      round(cost_gemini, 6),
+            })
+        with open(sf, 'w') as wf:
+            json.dump(payload, wf)
+    except Exception:
+        pass
+"
+GEMINI_EXIT=$?
+
+echo ""
+if [ "$GEMINI_EXIT" -eq 124 ]; then
+  echo "=== GEMINI TIMEOUT (>${TIMEOUT_SECS}s) — killed ==="
+elif [ "$GEMINI_EXIT" -eq 0 ]; then
+  echo "=== GEMINI DONE (exit: 0) ==="
+else
+  echo "=== GEMINI DONE (exit: $GEMINI_EXIT) ==="
+fi
+
+# ── Post-run metrics (always, including plan mode) ─────────────────────────────
+FILES_AFTER=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
+CHANGED=$(comm -13 <(echo "$FILES_BEFORE" | sort) <(echo "$FILES_AFTER" | sort) 2>/dev/null)
+FILES_CHANGED_COUNT=$(printf '%s\n' "$CHANGED" | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
+PY_ERRORS=0
+JS_ERRORS=0
+CHECKED=0
+
+# ── Post-run syntax checks (skipped in plan mode — nothing written) ────────────
+if [ "$MODE" != "plan" ]; then
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if [[ "$f" == *.py ]] && [ -f "$f" ]; then
+      if ! python3 -m py_compile "$f" 2>/tmp/gemini-syntax-err.txt; then
+        echo "  [SYNTAX ERROR] $f: $(cat /tmp/gemini-syntax-err.txt)"
+        PY_ERRORS=$((PY_ERRORS+1))
+      fi
+      CHECKED=$((CHECKED+1))
+    elif [[ "$f" == *.js ]] && [ -f "$f" ] && command -v node &>/dev/null; then
+      if ! node --check "$f" 2>/tmp/gemini-syntax-err.txt; then
+        echo "  [SYNTAX ERROR] $f: $(cat /tmp/gemini-syntax-err.txt)"
+        JS_ERRORS=$((JS_ERRORS+1))
+      fi
+      CHECKED=$((CHECKED+1))
+    fi
+  done <<< "$CHANGED"
+
+  if [ "$CHECKED" -gt 0 ]; then
+    TOTAL_ERRORS=$((PY_ERRORS+JS_ERRORS))
+    if [ "$TOTAL_ERRORS" -eq 0 ]; then
+      echo "=== SYNTAX OK ($CHECKED file(s) checked) ==="
+    else
+      echo "=== SYNTAX ERRORS: $TOTAL_ERRORS in $CHECKED file(s) — fix before committing ==="
+    fi
+  fi
+fi
+TOTAL_ERRORS=$((PY_ERRORS + JS_ERRORS))
+
+# ── Run log ────────────────────────────────────────────────────────────────────
+END_NS=$(date +%s%N)
+
+export DELEGATE_NAME="gemini"
+export DELEGATE_WORKDIR="$WORKDIR"
+export DELEGATE_EXIT="$GEMINI_EXIT"
+export DELEGATE_TIMEOUT="$TIMEOUT_SECS"
+export DELEGATE_PROMPT_WORDS="$PROMPT_WORDS"
+export DELEGATE_MODE="$MODE"
+export DELEGATE_FILES_CHANGED="$FILES_CHANGED_COUNT"
+export DELEGATE_SYNTAX_ERRORS="$TOTAL_ERRORS"
+export DELEGATE_START_NS="$START_NS"
+export DELEGATE_END_NS="$END_NS"
+
+python3 << 'PYLOG'
+import json, os
+from pathlib import Path
+from datetime import datetime, timezone
+
+LOG = Path.home() / '.local' / 'share' / 'delegate-runs.jsonl'
+LOG.parent.mkdir(parents=True, exist_ok=True)
+
+sf = os.environ.get('DELEGATE_STATS_FILE', '')
+stats = {}
+if sf:
+    try:
+        stats = json.loads(Path(sf).read_text())
+    except Exception:
+        pass
+
+start_ns = int(os.environ.get('DELEGATE_START_NS', 0) or 0)
+end_ns   = int(os.environ.get('DELEGATE_END_NS',   0) or 0)
+duration = round((end_ns - start_ns) / 1e9, 1) if start_ns and end_ns else 0
+
+entry = {
+    'ts':            datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'delegate':      os.environ.get('DELEGATE_NAME', 'gemini'),
+    'workdir':       os.environ.get('DELEGATE_WORKDIR', ''),
+    'project':       os.path.basename(os.environ.get('DELEGATE_WORKDIR', '')),
+    'prompt_words':  int(os.environ.get('DELEGATE_PROMPT_WORDS', 0) or 0),
+    'mode':          os.environ.get('DELEGATE_MODE', 'impl'),
+    'timeout_secs':  int(os.environ.get('DELEGATE_TIMEOUT', 0) or 0),
+    'exit_code':     int(os.environ.get('DELEGATE_EXIT', 0) or 0),
+    'timed_out':     os.environ.get('DELEGATE_EXIT') == '124',
+    'files_changed': int(os.environ.get('DELEGATE_FILES_CHANGED', 0) or 0),
+    'syntax_errors': int(os.environ.get('DELEGATE_SYNTAX_ERRORS', 0) or 0),
+    'duration_secs': duration,
+}
+entry.update(stats)
+
+with open(LOG, 'a') as f:
+    f.write(json.dumps(entry) + '\n')
+
+tok = entry.get('tokens_total', '?')
+print(f'[log] → {LOG}  ({tok} tokens, exit {entry["exit_code"]}, {duration}s)')
+PYLOG
+
+# ── Plan mode early exit (after log — no git summary needed) ──────────────────
+if [ "$MODE" = "plan" ]; then
+  echo ""
+  echo "=== PLAN MODE — no files written ==="
+  exit "$GEMINI_EXIT"
+fi
+
+# ── Git summary ────────────────────────────────────────────────────────────────
+GIT_AFTER=$(git rev-parse HEAD 2>/dev/null || echo "no-git")
+
+if [ "$GIT_BEFORE" != "$GIT_AFTER" ]; then
+  echo ""
+  echo "=== COMMITS CREATED ==="
+  git log "$GIT_BEFORE".."$GIT_AFTER" --oneline
+  echo ""
+  echo "=== DIFF STAT ==="
+  git diff "$GIT_BEFORE".."$GIT_AFTER" --stat
+else
+  echo ""
+  echo "=== UNCOMMITTED CHANGES ==="
+  git diff --stat 2>/dev/null || echo "(no git)"
+  git status --short 2>/dev/null
+fi
+
+exit $GEMINI_EXIT
