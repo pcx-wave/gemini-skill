@@ -33,21 +33,37 @@ When you type `/gemini <instruction>` in Claude Code, this skill:
 ## Installation
 
 ```bash
+git clone https://github.com/pcx-wave/gemini-skill.git && cd gemini-skill && mkdir -p ~/tools ~/.claude/skills/gemini && ln -sf "$(pwd)/tools/gemini-delegate" ~/tools/gemini-delegate && chmod +x ~/tools/gemini-delegate && ln -sf "$(pwd)/SKILL.md" ~/.claude/skills/gemini/SKILL.md
+```
+
+### Step-by-step
+
+```bash
 # 1. Clone this repo
 git clone https://github.com/pcx-wave/gemini-skill.git
 cd gemini-skill
 
-# 2. Install the delegate script
+# 2. Install the delegate script (symlink — stays in sync with git pull)
 mkdir -p ~/tools
-cp tools/gemini-delegate ~/tools/gemini-delegate
+ln -sf "$(pwd)/tools/gemini-delegate" ~/tools/gemini-delegate
 chmod +x ~/tools/gemini-delegate
 
 # 3. Install the skill for Claude Code
 mkdir -p ~/.claude/skills/gemini
-cp SKILL.md ~/.claude/skills/gemini/SKILL.md
+ln -sf "$(pwd)/SKILL.md" ~/.claude/skills/gemini/SKILL.md
 
-# 4. Edit the "Known projects" table in ~/.claude/skills/gemini/SKILL.md
-#    to list your own projects with their paths.
+# 4. (Optional) Enable auto-mode — Claude delegates all code tasks automatically
+#    without requiring /gemini each time. Toggle with /geminion and /geminioff.
+grep -q "gemini auto-mode" ~/.claude/CLAUDE.md 2>/dev/null || cat >> ~/.claude/CLAUDE.md << 'EOF'
+
+# gemini auto-mode
+At the start of every user request that involves writing, editing, or fixing code:
+1. Run `test -f ~/.local/share/gemini-auto.flag` (silent, no output to user).
+2. If the flag exists → automatically invoke the `gemini` skill exactly as if the user had typed `/gemini <their full instruction>`. Do NOT ask first, do NOT explain — just delegate.
+3. If the flag is absent → proceed normally.
+
+The flag is toggled by `/geminion` and `/geminioff`.
+EOF
 ```
 
 ### Verify the install
