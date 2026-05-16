@@ -63,7 +63,7 @@ DELEGATE_STATS_FILE=$(mktemp /tmp/delegate-stats-XXXXXX.json)
 printf '{}' > "$DELEGATE_STATS_FILE"
 export DELEGATE_STATS_FILE
 
-trap 'rm -f "$PROMPT_FILE" "$DELEGATE_STATS_FILE" /tmp/gemini-syntax-err.txt' EXIT
+trap 'rm -f "$PROMPT_FILE" "$DELEGATE_STATS_FILE"' EXIT
 printf '%s' "$PROMPT" > "$PROMPT_FILE"
 
 PROMPT_CONTENT=$(cat "$PROMPT_FILE")
@@ -188,39 +188,75 @@ fi
 FILES_AFTER=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 CHANGED=$(comm -13 <(echo "$FILES_BEFORE" | sort) <(echo "$FILES_AFTER" | sort) 2>/dev/null)
 FILES_CHANGED_COUNT=$(printf '%s\n' "$CHANGED" | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
-PY_ERRORS=0
-JS_ERRORS=0
-CHECKED=0
+SYNTAX_COUNT_FILE=$(mktemp /tmp/gemini-syntax-count-XXXXXX.txt)
+echo 0 > "$SYNTAX_COUNT_FILE"
+export DELEGATE_CHANGED="$CHANGED"
+export SYNTAX_COUNT_FILE
 
 # ── Post-run syntax checks (skipped in plan mode — nothing written) ────────────
 if [ "$MODE" != "plan" ]; then
-  while IFS= read -r f; do
-    [ -z "$f" ] && continue
-    if [[ "$f" == *.py ]] && [ -f "$f" ]; then
-      if ! python3 -m py_compile "$f" 2>/tmp/gemini-syntax-err.txt; then
-        echo "  [SYNTAX ERROR] $f: $(cat /tmp/gemini-syntax-err.txt)"
-        PY_ERRORS=$((PY_ERRORS+1))
-      fi
-      CHECKED=$((CHECKED+1))
-    elif [[ "$f" == *.js ]] && [ -f "$f" ] && command -v node &>/dev/null; then
-      if ! node --check "$f" 2>/tmp/gemini-syntax-err.txt; then
-        echo "  [SYNTAX ERROR] $f: $(cat /tmp/gemini-syntax-err.txt)"
-        JS_ERRORS=$((JS_ERRORS+1))
-      fi
-      CHECKED=$((CHECKED+1))
-    fi
-  done <<< "$CHANGED"
+python3 << 'PYSYNTAX'
+import os, shutil, subprocess
 
-  if [ "$CHECKED" -gt 0 ]; then
-    TOTAL_ERRORS=$((PY_ERRORS+JS_ERRORS))
-    if [ "$TOTAL_ERRORS" -eq 0 ]; then
-      echo "=== SYNTAX OK ($CHECKED file(s) checked) ==="
-    else
-      echo "=== SYNTAX ERRORS: $TOTAL_ERRORS in $CHECKED file(s) — fix before committing ==="
-    fi
-  fi
+changed = [f for f in os.environ.get('DELEGATE_CHANGED', '').splitlines() if f.strip()]
+# CWD is already $WORKDIR due to cd at script start
+errors  = 0
+checked = 0
+
+def has(cmd):
+    return shutil.which(cmd) is not None
+
+def check(cmd, label, cwd=None):
+    global errors, checked
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    checked += 1
+    if r.returncode != 0:
+        errors += 1
+        msg = (r.stderr or r.stdout).strip().split('\n')[0][:120]
+        print(f'  [SYNTAX ERROR] {label}: {msg}')
+
+for f in changed:
+    if not os.path.isfile(f):
+        continue
+    if   f.endswith('.py'):
+        check(['python3', '-m', 'py_compile', f], f)
+    elif f.endswith(('.js', '.mjs', '.cjs')) and has('node'):
+        check(['node', '--check', f], f)
+    elif f.endswith('.rb') and has('ruby'):
+        check(['ruby', '-c', f], f)
+    elif f.endswith(('.sh', '.bash')):
+        check(['bash', '-n', f], f)
+    elif f.endswith('.php') and has('php'):
+        check(['php', '-l', f], f)
+    elif f.endswith('.json'):
+        check(['python3', '-c', 'import json,sys;json.load(open(sys.argv[1]))', f], f)
+
+live = [f for f in changed if os.path.isfile(f)]
+if any(f.endswith('.go') for f in live) and has('go'):
+    check(['go', 'vet', './...'], 'go vet')
+if any(f.endswith('.rs') for f in live) and has('cargo'):
+    check(['cargo', 'check', '--quiet'], 'cargo check')
+if any(f.endswith(('.ts', '.tsx')) for f in live):
+    if has('tsc') and os.path.isfile('tsconfig.json'):
+        check(['tsc', '--noEmit', '--skipLibCheck'], 'tsc --noEmit')
+    else:
+        print('  [SKIP] tsc -- no tsconfig.json found, TypeScript not checked')
+
+if checked > 0:
+    if errors == 0:
+        print(f'=== SYNTAX OK ({checked} check(s)) ===')
+    else:
+        print(f'=== SYNTAX ERRORS: {errors} in {checked} check(s) -- fix before committing ===')
+
+cf = os.environ.get('SYNTAX_COUNT_FILE', '')
+if cf:
+    with open(cf, 'w') as fh:
+        fh.write(str(errors))
+PYSYNTAX
 fi
-TOTAL_ERRORS=$((PY_ERRORS + JS_ERRORS))
+TOTAL_ERRORS=$(cat "$SYNTAX_COUNT_FILE" 2>/dev/null || echo 0)
+rm -f "$SYNTAX_COUNT_FILE"
+TOTAL_ERRORS=${TOTAL_ERRORS:-0}
 
 # ── Run log ────────────────────────────────────────────────────────────────────
 END_NS=$(date +%s%N)

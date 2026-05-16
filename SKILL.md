@@ -57,22 +57,24 @@ The delegate script handles this by `cd`-ing into the workdir before running.
 ### 6. No pseudo-TTY needed (positive difference vs Vibe)
 Gemini CLI works fine in a plain pipe — no `script -q -c` wrapper needed.
 
----
+### 7. Orchestration chain has 5 independent failure points
+The delegation pipeline is: Gemini CLI -> plain pipe -> Python stream parser -> result event tokens -> git diff -> JSON log. Each link can fail independently:
 
-## Known projects
+| Link | Failure mode | Symptom |
+|------|-------------|---------|
+| Gemini CLI | Auth expired, quota hit, 503 | Immediate exit or silent 90s hang |
+| Stream parser | Gemini changes its JSON event schema | Tool calls not detected, token count 0 |
+| result event | Missing on timeout or crash | Tokens logged as 0, cost not computed |
+| git diff | Not a git repo, or Gemini committed mid-run | Wrong file count |
+| JSON log | ~/.local/share/ not writable | Silent log skip |
 
-<!-- Customize this table for your own projects -->
-| Name | Path |
-|------|------|
-| my-project | /path/to/my-project |
+When a run produces unexpected results, check these links top to bottom.
 
----
 
 ## Step 1 — Detect workdir
 
-1. If the instruction mentions a known project → use its path.
-2. Otherwise: `git rev-parse --show-toplevel` in the current directory.
-3. If ambiguous → ask with `AskUserQuestion`.
+1. `git rev-parse --show-toplevel` in the current directory.
+2. If ambiguous or no git repo → ask with `AskUserQuestion`.
 
 ---
 
@@ -93,9 +95,23 @@ touching any files. Proposed writes appear as `[plan-write]` and are blocked.
 **Critical rule**: Gemini works best on **atomic, focused tasks**.
 Given the context overhead and 503 risk, keep tasks smaller than you might expect.
 
+**Decide whether to delegate at all:**
+
+`gemini-delegate` has real overhead (503 backoff, context load, stream parser, git diff, JSON log). For trivial changes the setup cost exceeds the savings.
+
+| Signal | Action |
+|--------|--------|
+| 1 file, ≤ ~10 lines to change, location already known | **Do it directly** — don't delegate |
+| 1 file, logic non-trivial OR location unclear | Delegate |
+| 2–3 files, single objective | Delegate |
+| >3 files OR multi-step logic OR migrations | Delegate, broken into sub-tasks |
+
+The sweet spot is **medium to heavy tasks**.
+
 | Size | Definition | Approach |
 |------|-----------|----------|
-| **Simple** | 1 file, 1 clear change | 1 gemini call, impl mode |
+| **Trivial** | 1 file, change is obvious and located | **Skip delegation — edit directly** |
+| **Simple** | 1 file, non-trivial logic or unknown location | 1 gemini call, impl mode |
 | **Medium** | 2–3 related files, 1 goal | 1 gemini call with structured prompt |
 | **Complex** | >3 files OR business logic OR DB migrations | **Decompose** |
 
@@ -240,6 +256,8 @@ In `plan` mode, proposed writes are blocked and shown as `[plan-write]`:
 | `[gemini]`   | Assistant text response                  |
 | `[WARN]`     | Tool error detected                      |
 
+**Gemini never commits.** All changes are left unstaged — `git checkout .` reverts everything if needed.
+
 **Red flags to act on immediately:**
 - `[WARN]` → Gemini hit a tool error
 - `exit: 1` or non-zero → Gemini failed or left verification incomplete
@@ -267,6 +285,32 @@ In `plan` mode, proposed writes are blocked and shown as `[plan-write]`:
 - Between attempts, **read the git diff** to avoid doubling partial work.
 - If Gemini did 50% and timed out: complete the rest manually rather than relaunching.
 - If 503s are eating all attempts: pause and retry in 10+ minutes.
+
+---
+
+## Step 7b — Log manual completion
+
+When you finish a task manually (after Gemini failures), run this:
+
+```bash
+python3 -c "
+import json, datetime, subprocess, os
+workdir = subprocess.run(['git','rev-parse','--show-toplevel'], capture_output=True, text=True).stdout.strip() or os.getcwd()
+project = os.path.basename(workdir.rstrip('/'))
+stat = subprocess.run(['git','-C',workdir,'diff','--stat'], capture_output=True, text=True).stdout
+lines_added = sum(int(l.split('+')[1].split()[0]) for l in stat.splitlines() if '|' in l and '+' in l) if stat else 0
+files_changed = len([l for l in stat.splitlines() if '|' in l])
+tokens_out = lines_added * 10
+tokens_in  = lines_added * 40
+cost = (tokens_in * 3.0 + tokens_out * 15.0) / 1_000_000
+entry = {'ts': datetime.datetime.utcnow().isoformat() + 'Z', 'delegate': 'claude-manual', 'workdir': workdir, 'project': project, 'exit_code': 0, 'files_changed': files_changed, 'tokens_in': tokens_in, 'tokens_out': tokens_out, 'tokens_total': tokens_in + tokens_out, 'cost_usd': round(cost, 6), 'cost_estimated': True, 'lines_added': lines_added}
+log = os.path.expanduser('~/.local/share/delegate-runs.jsonl')
+open(log, 'a').write(json.dumps(entry) + '\n')
+print(f'[log] claude-manual -> {project}  ~{lines_added} lines  est. cost ${cost:.4f}')
+"
+```
+
+Run from anywhere inside the project. Flagged cost_estimated true in the log.
 
 ---
 
