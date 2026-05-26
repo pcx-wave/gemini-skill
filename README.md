@@ -33,7 +33,7 @@ When you type `/gemini <instruction>` in Claude Code, this skill:
 ## Installation
 
 ```bash
-git clone https://github.com/pcx-wave/gemini-skill.git && cd gemini-skill && mkdir -p ~/tools ~/.claude/skills/gemini && ln -sf "$(pwd)/tools/gemini-delegate" ~/tools/gemini-delegate && chmod +x ~/tools/gemini-delegate && ln -sf "$(pwd)/SKILL.md" ~/.claude/skills/gemini/SKILL.md
+git clone https://github.com/pcx-wave/gemini-skill.git && cd gemini-skill && mkdir -p ~/tools ~/.claude/skills/gemini && ln -sf "$(pwd)/tools/gemini-delegate" ~/tools/gemini-delegate && ln -sf "$(pwd)/tools/delegate-report" ~/tools/delegate-report && chmod +x ~/tools/gemini-delegate ~/tools/delegate-report && ln -sf "$(pwd)/SKILL.md" ~/.claude/skills/gemini/SKILL.md
 ```
 
 ### Step-by-step
@@ -43,10 +43,11 @@ git clone https://github.com/pcx-wave/gemini-skill.git && cd gemini-skill && mkd
 git clone https://github.com/pcx-wave/gemini-skill.git
 cd gemini-skill
 
-# 2. Install the delegate script (symlink — stays in sync with git pull)
+# 2. Install the scripts (symlinks — stay in sync with git pull)
 mkdir -p ~/tools
 ln -sf "$(pwd)/tools/gemini-delegate" ~/tools/gemini-delegate
-chmod +x ~/tools/gemini-delegate
+ln -sf "$(pwd)/tools/delegate-report" ~/tools/delegate-report
+chmod +x ~/tools/gemini-delegate ~/tools/delegate-report
 
 # 3. Install the skill for Claude Code
 mkdir -p ~/.claude/skills/gemini
@@ -76,6 +77,16 @@ gemini --version
 ~/tools/gemini-delegate /tmp "Say hello in one sentence." 120 plan
 # Should print: [gemini] Hello! ...
 ```
+
+### Updating
+
+Because the install uses symlinks, a `git pull` is all you need:
+
+```bash
+cd ~/gemini-skill && git pull
+```
+
+`~/tools/gemini-delegate` and all skill files are automatically up to date — no re-copy needed.
 
 ---
 
@@ -194,11 +205,25 @@ Edit `~/.claude/skills/gemini/SKILL.md`:
 
 ---
 
-## Sister project
+## Run Log
 
-A parallel delegate using **Mistral Vibe** instead of Gemini is available at
-[pcx-wave/vibe-skill](https://github.com/pcx-wave/vibe-skill).
-Same orchestration pattern, same run log format — different model and trade-offs.
+Every run appends one JSON entry to `~/.local/share/delegate-runs.jsonl`.
+The shared `~/tools/delegate-report` script can query all runs across delegates.
+
+```bash
+~/tools/delegate-report                  # full report
+~/tools/delegate-report --since 7        # last 7 days
+~/tools/delegate-report --fails          # failures only
+```
+
+---
+
+## Sister projects
+
+- [vibe-skill](https://github.com/pcx-wave/vibe-skill) — delegate to Mistral Vibe
+- [opencode-skill](https://github.com/pcx-wave/opencode-skill) — delegate to OpenCode CLI
+
+All three write to the same `delegate-runs.jsonl` log, making runs comparable across delegates.
 
 ---
 
