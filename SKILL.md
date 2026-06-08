@@ -3,12 +3,43 @@ name: gemini
 description: >
   Delegate a coding task to Gemini CLI and supervise the result via git diff.
   Trigger: /gemini <instruction>. Claude orchestrates, Gemini codes.
+  Also handles /gemini-report [--since N] [--project NAME] [--fails] — token/cost/failure report.
 license: MIT
 user-invocable: true
 allowed-tools:
   - bash
   - read_file
   - grep
+---
+
+## /geminion | /geminioff | /geministatus
+
+Toggle auto-delegate mode — Gemini automatically handles all coding tasks without
+requiring `/gemini` each time.
+
+| Command | Action |
+|---------|--------|
+| `/geminion` | `touch ~/.local/share/gemini-auto.flag` → confirm "Auto-gemini ON" |
+| `/geminioff` | `rm -f ~/.local/share/gemini-auto.flag` → confirm "Auto-gemini OFF" |
+| `/geministatus` | check `~/.local/share/gemini-auto.flag` → report ON or OFF |
+
+Run the bash command, print one confirmation line, and stop.
+
+---
+
+## /gemini-report
+
+If the user invokes `/gemini-report`, run `~/tools/delegate-report` with any flags
+extracted from the arguments, display output verbatim, and stop.
+
+| User says | Flag |
+|-----------|------|
+| "last 7 days", "7d" | `--since 7` |
+| "last 30 days", "30d" | `--since 30` |
+| "project foo" | `--project foo` |
+| "only failures", "fails", "bugs" | `--fails` |
+| (nothing) | (no flags — full report) |
+
 ---
 
 # Gemini Orchestrator
@@ -150,6 +181,10 @@ VERIFY: grep for "def function_name" in file.py and confirm it exists.
 - Include a grep-based verification criterion (not a file re-read)
 - Language: English (better Gemini performance)
 - Keep prompts under ~500 words — longer prompts increase context overhead
+
+**Prompt adaptations:**
+- **Any task that defines or calls a specific function**: include the exact signature — `def validate(data: dict) -> tuple[bool, list[str]]:`.
+- **No fixed signature, but conventions matter**: point at the file to read first ("read app.py, follow its route/jsonify style") instead — don't do both, they're substitutes.
 
 **Verification — always use grep, not file re-read:**
 ```
@@ -412,3 +447,5 @@ jq -r '.cost_usd' ~/.local/share/delegate-runs.jsonl \
 
 A sister delegate using Mistral Vibe exists: [vibe-skill](https://github.com/pcx-wave/vibe-skill).
 Both write to the same `delegate-runs.jsonl` log, making runs comparable across delegates.
+
+This skill is improved regularly — run [update-skills](https://github.com/pcx-wave/update-skills) to pull the latest version of this skill, as well as all your other skills!
